@@ -9,15 +9,55 @@
 //! Byte strides, memory regions and halving scores are evaluated in `u128`
 //! from exact byte magnitudes `|s| · elem_size`. For extents `d ≥ 1` whose
 //! product fits in `usize` (callers check it with `kernel::total_len`), every
-//! intermediate is exact, so the result is the block vector of the
-//! mathematical-integer model, for any element size and any stride. Outside
-//! that precondition the region arithmetic saturates: both budget comparisons
-//! keep their unbounded outcome and nothing panics.
+//! intermediate is exact. The result is then the block vector of the
+//! mathematical-integer model, for any element size and any stride, provided
+//! the core's stride-order table (operands × rank entries) has a representable
+//! length and its storage is obtained.
+//!
+//! - **Checked-length fallback.** If that length overflows `usize`, the full
+//!   dimensions are returned. They are a valid block vector (`1 ≤ b_i ≤ d_i`)
+//!   but not, in general, the model's result.
+//! - **Outside the shape-product precondition.** The region arithmetic
+//!   saturates: both budget comparisons keep their unbounded outcome and
+//!   nothing panics.
 
 use crate::fuse::compute_costs;
-use crate::inline::{InlineVec, OperandVec};
+use crate::inline::{InlineVec, OPERAND_CAP};
 use crate::{BLOCK_MEMORY_SIZE, CACHE_LINE_SIZE};
 use strided_view::auxiliary::index_order;
+
+/// Operand-major scratch of the core's stride orders: inline up to
+/// [`OPERAND_CAP`] operands of `INLINE_RANK` axes, spilling above.
+type Scratch<T> = tinyvec::TinyVec<[T; OPERAND_CAP * strided_view::INLINE_RANK]>;
+
+/// The core's per-operand metadata. Byte strides are formed on the fly from
+/// the element strides (`|s| * elem_size`, exact in `u128`) rather than
+/// stored; the stride orders sit in one flat table where row `k` holds
+/// operand `k` at a pitch of the original rank on every recursion level, so
+/// the suffix at `offset` is `[k * pitch + offset .. (k + 1) * pitch]`.
+struct Rows<'a> {
+    pitch: usize,
+    strides: &'a [&'a [isize]],
+    elem_size: u128,
+    orders: &'a [usize],
+}
+
+impl<'a> Rows<'a> {
+    fn operands(&self) -> usize {
+        self.strides.len()
+    }
+
+    fn byte_strides(&self, operand: usize, offset: usize) -> impl Iterator<Item = u128> + 'a {
+        let elem_size = self.elem_size;
+        self.strides[operand][offset..]
+            .iter()
+            .map(move |&s| s.unsigned_abs() as u128 * elem_size)
+    }
+
+    fn orders(&self, operand: usize, offset: usize) -> &[usize] {
+        &self.orders[operand * self.pitch + offset..(operand + 1) * self.pitch]
+    }
+}
 
 /// Compute block sizes for tiled iteration.
 ///
@@ -32,6 +72,8 @@ use strided_view::auxiliary::index_order;
 /// byte stride is 0, so every stride order is 1 and every axis is kept), and
 /// operands whose strides are all nonzero and strictly increasing in
 /// magnitude (each operand's stride order is `1..=r`, so every axis is kept).
+/// The region test and both exits read the strides directly; the core's
+/// metadata is built only when they do not apply.
 ///
 /// # Arguments
 /// * `dims` - The dimensions, in iteration order, each at least 1
@@ -46,43 +88,45 @@ pub(crate) fn compute_block_sizes(
     strides_list: &[&[isize]],
     elem_size: usize,
 ) -> InlineVec<usize> {
+    let mut blocks: InlineVec<usize> = dims.iter().copied().collect();
     if dims.is_empty() || elem_size == 0 {
-        return dims.iter().copied().collect();
+        return blocks;
     }
 
     let elem_size = elem_size as u128;
-    let byte_strides: OperandVec<InlineVec<u128>> = strides_list
-        .iter()
-        .map(|strides| {
+    let fits = memory_region(
+        dims,
+        strides_list.iter().map(|strides| {
             strides
                 .iter()
                 .map(|&s| s.unsigned_abs() as u128 * elem_size)
-                .collect()
-        })
-        .collect();
-    let byte_stride_refs: OperandVec<&[u128]> = byte_strides.iter().map(|s| s.as_slice()).collect();
-
-    if total_memory_region_at(dims, &byte_stride_refs, 0) <= BLOCK_MEMORY_SIZE as u128
-        || strides_list.iter().all(|s| strictly_increasing(s))
-    {
-        return dims.iter().copied().collect();
+        }),
+    ) <= BLOCK_MEMORY_SIZE as u128;
+    if fits || strides_list.iter().all(|s| strictly_increasing(s)) {
+        return blocks;
     }
 
-    // With `elem_size > 0` the byte strides are an exact positive multiple of
-    // the element strides, so both have the same stride order.
-    let stride_orders: OperandVec<InlineVec<usize>> =
-        strides_list.iter().map(|s| index_order(s)).collect();
-    let stride_order_refs: OperandVec<&[usize]> =
-        stride_orders.iter().map(|s| s.as_slice()).collect();
+    let pitch = dims.len();
+    // A table length beyond `usize` cannot be stored; full dimensions are a
+    // valid block vector, though not the model's result in general.
+    let Some(len) = strides_list.len().checked_mul(pitch) else {
+        return blocks;
+    };
+    let mut orders: Scratch<usize> = Scratch::with_capacity(len);
+    for strides in strides_list {
+        // With `elem_size > 0` the byte strides are an exact positive
+        // multiple of the element strides, so both have the same stride order.
+        orders.extend_from_slice(&index_order(strides));
+    }
     let costs = compute_costs(strides_list);
-
-    compute_blocks(
-        dims,
-        &costs,
-        &byte_stride_refs,
-        &stride_order_refs,
-        BLOCK_MEMORY_SIZE,
-    )
+    let rows = Rows {
+        pitch,
+        strides: strides_list,
+        elem_size,
+        orders: &orders,
+    };
+    compute_blocks_at(&mut blocks, 0, &costs, &rows, BLOCK_MEMORY_SIZE);
+    blocks
 }
 
 /// Whether every stride is nonzero and strictly larger in magnitude than the
@@ -94,7 +138,47 @@ fn strictly_increasing(strides: &[isize]) -> bool {
             .all(|w| w[0].unsigned_abs() < w[1].unsigned_abs())
 }
 
-/// Compute block sizes using the Julia algorithm.
+/// [`compute_blocks_at`] over per-operand slices, for the unit tests.
+#[cfg(test)]
+fn compute_blocks(
+    dims: &[usize],
+    costs: &[isize],
+    byte_strides: &[&[u128]],
+    stride_orders: &[&[usize]],
+    block_size: usize,
+) -> InlineVec<usize> {
+    let mut blocks: InlineVec<usize> = dims.iter().copied().collect();
+    if dims.is_empty() {
+        return blocks;
+    }
+    // The tests give byte strides directly: as element strides of a 1-byte
+    // element they produce exactly those byte magnitudes.
+    let strides: Vec<Vec<isize>> = byte_strides
+        .iter()
+        .map(|s| {
+            s.iter()
+                .map(|&b| isize::try_from(b).expect("test byte strides fit isize"))
+                .collect()
+        })
+        .collect();
+    let strides: Vec<&[isize]> = strides.iter().map(|s| s.as_slice()).collect();
+    let flat_orders: Vec<usize> = stride_orders
+        .iter()
+        .flat_map(|s| s.iter().copied())
+        .collect();
+    let rows = Rows {
+        pitch: dims.len(),
+        strides: &strides,
+        elem_size: 1,
+        orders: &flat_orders,
+    };
+    compute_blocks_at(&mut blocks, 0, costs, &rows, block_size);
+    blocks
+}
+
+/// Recursive core of Julia's `_computeblocks` on the axes `offset..` of
+/// `blocks`, which hold the full dimensions there on entry and the blocks on
+/// return. The leading `offset` axes are already fixed.
 ///
 /// # Julia equivalent
 /// ```julia
@@ -105,103 +189,68 @@ fn strictly_increasing(strides: &[isize]) -> bool {
 ///     # ... reduction logic
 /// end
 /// ```
-fn compute_blocks(
-    dims: &[usize],
-    costs: &[isize],
-    byte_strides: &[&[u128]],
-    stride_orders: &[&[usize]],
-    block_size: usize,
-) -> InlineVec<usize> {
-    compute_blocks_at(dims, 0, costs, byte_strides, stride_orders, block_size)
-}
-
-/// Recursive core of [`compute_blocks`] with `offset` tracking how many
-/// leading axes have already been fixed. Indexing each operand's stride slice
-/// from `offset` keeps the recursion allocation-free at the inline bound
-/// (#306 P1).
 fn compute_blocks_at(
-    dims: &[usize],
+    blocks: &mut [usize],
     offset: usize,
     costs: &[isize],
-    byte_strides: &[&[u128]],
-    stride_orders: &[&[usize]],
+    rows: &Rows<'_>,
     block_size: usize,
-) -> InlineVec<usize> {
-    let n = dims.len();
-    if n == 0 {
-        return InlineVec::new();
+) {
+    if offset == blocks.len() {
+        return;
     }
-
     let block_size_bytes = block_size as u128;
+    let operands = rows.operands();
+    let region = |blocks: &[usize]| {
+        memory_region(blocks, (0..operands).map(|k| rows.byte_strides(k, offset)))
+    };
 
     // If everything fits in cache, use full dims
-    if total_memory_region_at(dims, byte_strides, offset) <= block_size_bytes {
-        return dims.iter().copied().collect();
+    if region(&blocks[offset..]) <= block_size_bytes {
+        return;
     }
 
     // Check if first dimension is smallest stride for all arrays
-    let min_order = stride_orders
-        .iter()
-        .filter_map(|orders| orders[offset..].iter().min().copied())
+    let min_order = (0..operands)
+        .filter_map(|k| rows.orders(k, offset).iter().min().copied())
         .min()
         .unwrap_or(1);
-
-    if stride_orders
-        .iter()
-        .all(|orders| !orders[offset..].is_empty() && orders[offset] == min_order)
-    {
+    if (0..operands).all(|k| rows.orders(k, offset).first() == Some(&min_order)) {
         // First dimension has smallest stride in all arrays
         // Keep first dimension, recurse on rest
-        let tail_blocks = compute_blocks_at(
-            &dims[1..],
-            offset + 1,
-            &costs[1..],
-            byte_strides,
-            stride_orders,
-            block_size,
-        );
-
-        let mut result: InlineVec<usize> = InlineVec::new();
-        result.push(dims[0]);
-        result.extend(tail_blocks);
-        return result;
+        compute_blocks_at(blocks, offset + 1, costs, rows, block_size);
+        return;
     }
 
     // Check if minimum stride is larger than block size
-    let min_stride = byte_strides
-        .iter()
-        .filter_map(|s| s[offset..].iter().min().copied())
+    let min_stride = (0..operands)
+        .filter_map(|k| rows.byte_strides(k, offset).min())
         .min()
         .unwrap_or(0);
-
+    let tail = &mut blocks[offset..];
     if min_stride > block_size_bytes {
-        return (0..n).map(|_| 1).collect();
+        tail.fill(1);
+        return;
     }
 
     // Iteratively reduce blocks
-    let mut blocks: InlineVec<usize> = dims.iter().copied().collect();
+    let costs = &costs[offset..];
 
     // Phase 1: Halve until within 2x of target
-    while total_memory_region_at(&blocks, byte_strides, offset) >= 2 * block_size_bytes {
-        let i = last_argmax_weighted(&blocks, costs);
-        if i.is_none() || blocks[i.unwrap()] <= 1 {
+    while region(tail) >= 2 * block_size_bytes {
+        let Some(i) = last_argmax_weighted(tail, costs) else {
             break;
-        }
-        let i = i.unwrap();
-        blocks[i] = blocks[i].div_ceil(2);
+        };
+        tail[i] = tail[i].div_ceil(2);
     }
 
     // Phase 2: Decrement until within target
-    while total_memory_region_at(&blocks, byte_strides, offset) > block_size_bytes {
-        let i = last_argmax_weighted(&blocks, costs);
-        if i.is_none() || blocks[i.unwrap()] <= 1 {
+    while region(tail) > block_size_bytes {
+        let Some(i) = last_argmax_weighted(tail, costs) else {
             break;
-        }
-        let i = i.unwrap();
-        blocks[i] -= 1;
+        };
+        tail[i] -= 1;
     }
-
-    blocks
 }
 
 /// Compute total memory region for cache considerations.
@@ -232,25 +281,22 @@ fn compute_blocks_at(
 /// end
 /// ```
 ///
-/// `byte_strides` holds byte stride magnitudes. The sums and products
-/// saturate, which is exact whenever the extents' product fits in `usize`.
-#[cfg(test)]
-fn total_memory_region(dims: &[usize], byte_strides: &[&[u128]]) -> u128 {
-    total_memory_region_at(dims, byte_strides, 0)
-}
-
-/// As [`total_memory_region`], but with the leading `offset` axes fixed. The
-/// recursion in `compute_blocks_at` uses it to avoid materializing tail slices.
-fn total_memory_region_at(dims: &[usize], byte_strides: &[&[u128]], offset: usize) -> u128 {
+/// `byte_strides` yields each operand's byte stride magnitudes. The sums and
+/// products saturate, which is exact whenever the extents' product fits in
+/// `usize`.
+fn memory_region<O, S>(dims: &[usize], byte_strides: O) -> u128
+where
+    O: Iterator<Item = S>,
+    S: Iterator<Item = u128>,
+{
     let cache_line = CACHE_LINE_SIZE as u128;
     let mut memory_region = 0u128;
 
     for strides in byte_strides {
-        let strides = &strides[offset..];
         let mut num_contiguous_bytes = 0u128;
         let mut num_cache_line_blocks = 1u128;
 
-        for (&d, &s) in dims.iter().zip(strides.iter()) {
+        for (&d, s) in dims.iter().zip(strides) {
             if s < cache_line {
                 // Small stride: contributes to contiguous region. The product
                 // is below 2^70, so only the sum can saturate.
@@ -273,6 +319,12 @@ fn total_memory_region_at(dims: &[usize], byte_strides: &[&[u128]], offset: usiz
     }
 
     memory_region
+}
+
+/// [`memory_region`] over per-operand slices, for the unit tests.
+#[cfg(test)]
+fn total_memory_region(dims: &[usize], byte_strides: &[&[u128]]) -> u128 {
+    memory_region(dims, byte_strides.iter().map(|s| s.iter().copied()))
 }
 
 /// Find the last index with maximum (value - 1) * cost.
