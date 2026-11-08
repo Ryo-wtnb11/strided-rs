@@ -75,7 +75,13 @@ provides a separately validated non-overlap contract; it remains a benchmark
 target. Raw `CopyPlan` / `UpdatePlan` replay and the plan-free `replay_*_raw`
 entries split their logical index range across the token's budget under the
 same copy-class rule, on a destination proven injective; the plan-free entries
-replay any other destination serially in column-major order.
+replay any other destination serially in column-major order. A layout whose
+shared cache-block model changes the visit order is walked tile by tile
+instead, and splits with the view path's tree splitter (gated per node, on the
+caller's token), each leaf walking its sub-box with the same tiles. Layouts
+whose regrouped runs share no cache line, such as a permutation of whole
+contiguous runs, keep the flat walk: tiling them cannot save traffic, and the
+flat split stays balanced.
 
 ### Reduction evaluation order and the deterministic route
 

@@ -636,3 +636,66 @@ fn build_plan_forwards_ordered_dims_and_strides() {
     assert_eq!(plan.order.as_slice(), [1, 0]);
     assert_eq!(plan.block.as_slice(), [1000, 3]);
 }
+
+/// Column-major strides of `dims` laid out in the axis order `perm`.
+fn permuted_strides(dims: &[usize], perm: &[usize]) -> Vec<isize> {
+    let mut strides = vec![0isize; dims.len()];
+    let mut stride = 1isize;
+    for &axis in perm {
+        strides[axis] = stride;
+        stride *= dims[axis] as isize;
+    }
+    strides
+}
+
+#[test]
+fn flat_scratch_matches_the_model_across_its_spill_boundaries() {
+    // T9: ranks around INLINE_RANK, operand counts around OPERAND_CAP, and
+    // flat tables of 16, 18, 40, 45 and 72 entries; each operand walks the
+    // axes in a different order, so every case reaches the core.
+    let cases: [(usize, usize); 5] = [(8, 2), (9, 2), (8, 5), (9, 5), (12, 6)];
+    for (rank, operands) in cases {
+        let dims: Vec<usize> = (0..rank).map(|i| 2 + i % 3).collect();
+        let strides: Vec<Vec<isize>> = (0..operands)
+            .map(|k| {
+                // Rotate by k, reversed for odd k: a distinct order per operand.
+                let mut perm: Vec<usize> = (0..rank).map(|i| (i + k) % rank).collect();
+                if k % 2 == 1 {
+                    perm.reverse();
+                }
+                permuted_strides(&dims, &perm)
+            })
+            .collect();
+        let strides = refs(&strides);
+        assert!(!strides.iter().all(|s| strictly_increasing(s)));
+        let blocks = compute_block_sizes(&dims, &strides, 8);
+        assert_ne!(
+            blocks.as_slice(),
+            dims.as_slice(),
+            "rank {rank}, {operands} operands"
+        );
+        assert_eq!(
+            blocks.as_slice(),
+            model_blocks(&dims, &strides, 8),
+            "rank {rank}, {operands} operands"
+        );
+    }
+
+    // Keep-first recursion: axis 0 is every operand's unit axis, so the core
+    // keeps it and continues on the suffix at offset 1 (and further), where
+    // the operands disagree; the suffix rows are read at the original pitch.
+    let dims = [8usize, 5, 6, 7, 4, 3];
+    let strides: Vec<Vec<isize>> = [
+        [0usize, 1, 2, 3, 4, 5],
+        [0, 5, 4, 3, 2, 1],
+        [0, 3, 1, 5, 2, 4],
+    ]
+    .iter()
+    .map(|perm| permuted_strides(&dims, perm))
+    .collect();
+    let strides = refs(&strides);
+    let blocks = compute_block_sizes(&dims, &strides, 8);
+    assert_eq!(blocks[0], dims[0]);
+    assert_ne!(blocks.as_slice(), dims.as_slice());
+    assert_eq!(blocks.as_slice(), model_blocks(&dims, &strides, 8));
+}
