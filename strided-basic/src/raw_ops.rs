@@ -340,11 +340,13 @@ pub(crate) fn pair_tiles<D, S>(layout: &FusedPairLayout) -> Option<PairTiles> {
     let dims = &layout.dims[..rank];
     let dst = &layout.dst_strides[..rank];
     let src = &layout.src_strides[..rank];
-    let model = crate::block::compute_block_sizes(
+    // `None`: one of the model's exits keeps the full dimensions, which
+    // cannot change the visit order.
+    let model = crate::block::reduced_block_sizes(
         dims,
         &[dst, src],
         core::mem::size_of::<D>().max(core::mem::size_of::<S>()),
-    );
+    )?;
     let first_cut = (0..rank).find(|&axis| model[axis] < dims[axis])?;
     if model[first_cut + 1..].iter().all(|&block| block == 1) {
         return None;
